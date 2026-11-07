@@ -329,7 +329,7 @@ select{font:inherit;font-weight:700;border-radius:10px;border:2px solid var(--pa
 <section id="break" hidden>
   <canvas id="breakCanvas"></canvas>
   <div class="hud"><div id="bTime">⏱ 30</div><div id="bLevel">⭐ Level 1</div><div id="bScore">🍉 0</div></div>
-  <div class="tip" id="bTip">Here they come! Tap them to throw ninja stars! 🎯</div>
+  <div class="tip" id="bTip">Tap to throw, or drag a line across them! Drag longer to power up! ⚡</div>
 </section>
 
 <div class="modal" id="modal" hidden><div class="modal-card" id="modalCard" role="dialog" aria-modal="true"></div></div>
@@ -672,7 +672,7 @@ function breakIntro() {
   const what = L === 1 ? 'One sneaky fruit is charging at you!' : `${Math.min(L, 8)} sneaky fruits &amp; veggies are charging at you!`;
   modal(`<div class="big-emoji"><span class="spin">✴️</span></div>
     <h2>Brain Break!</h2>
-    <p>You solved ${S.goal} facts! <b>Level ${L}:</b> ${what} Tap to throw ninja stars. Each one takes a few hits! 🍉🥕🍓</p>
+    <p>You solved ${S.goal} facts! <b>Level ${L}:</b> ${what} Tap to throw a ninja star, or drag a line across them to throw it that way. Drag longer to power it up for extra damage! Each one takes a few hits! 🍉🥕🍓</p>
     <div class="actions"><button class="btn green big" id="goBreak">Let's go! 🥷</button></div>`);
   $('#goBreak').onclick = () => { closeModal(); show('break'); Break.start(breakDone); };
 }
@@ -718,7 +718,8 @@ const Break = (() => {
     sprites.set(e, c); return c;
   }
   let W, H, R, HY, CAM, LAT, enemies, stars, pieces, drops, texts, confetti = [], timeLeft, running = false, ending, endT, last, onDone,
-    lastThrow = 0, aimX, aimY, throwT = 0, secShown, level, defeated, cleared, banner, nextLevelT, shake, bump;
+    lastThrow = 0, aimX, aimY, throwT = 0, secShown, level, defeated, cleared, banner, nextLevelT, shake, bump,
+    slashes = [], loose = [], cuts = [], tapHintAt = 0;
 
   // perspective: world (wx = sideways, z = distance) -> screen
   const proj = (wx, z) => ({ x: W / 2 + wx * LAT / z, y: HY + CAM / z });
@@ -800,7 +801,8 @@ const Break = (() => {
       const lane = sp.count === 1 ? 0 : -.8 + 1.6 * i / (sp.count - 1);
       enemies.push({ e, col, size, hp: sp.hp, max: sp.hp,
         base: lane + rand(-.08, .08), wx: lane, z: Z_FAR + .3 + i * .7 + rand(0, .4),
-        drift: rand(-.12, .12), sway: sp.sway, vz: sp.speed * rand(.9, 1.1), kb: 0, t: rand(0, 6), flash: 0, wob: 0 });
+        drift: rand(-.12, .12), sway: sp.sway, vz: sp.speed * rand(.9, 1.1), kb: 0, t: rand(0, 6), flash: 0, wob: 0,
+        stuck: [], spin: 0, spinV: 0, tilt: 0, goal: lane, dashT: 0 });
     }
     $('#bLevel').textContent = '⭐ Level ' + level;
     banner = { t: 'Level ' + level, sub: sp.count === 1 ? `Hit it ${sp.hp} times!` : `${sp.count} to stop · ${sp.hp} hits each`, life: 1.8 };
@@ -815,45 +817,122 @@ const Break = (() => {
     for (let i = 0; i < 50; i++) confetti.push({ x: rand(0, W), y: rand(-H * .3, 0), vx: rand(-40, 40), vy: rand(120, 260), rot: rand(0, 6), vr: rand(-6, 6), col: pick(cols), life: 2.5 });
   }
 
+  /* --- how goofy an enemy is: 0 = not hit yet, 1 = almost done --- */
+  const dizzy = en => 1 - en.hp / en.max;
+  function tiltOf(en) {
+    const dz = dizzy(en);
+    return Math.sin(en.t * 5.5) * .08 + Math.sin(en.wob * 40) * en.wob * .6 + Math.sin(en.t * 7) * .35 * dz + en.spin;
+  }
+
   /* --- screen position of an enemy (set each frame) --- */
   function place(en) {
     const p = proj(en.wx, en.z), r = R * 3.1 * en.size / en.z;
-    const hop = Math.abs(Math.sin(en.t * 5.5)) * r * .35;
+    const dz = dizzy(en);
+    const hop = Math.abs(Math.sin(en.t * (5.5 + dz * 3))) * r * .35 * (1 + dz * .9 * Math.abs(Math.sin(en.t * 1.9)));
     en.sx = p.x; en.foot = p.y; en.sr = r; en.sy = p.y - r * .95 - hop; en.hop = hop;
   }
 
   /* --- actions --- */
   const handPos = () => ({ x: W * .66 + (aimX - W / 2) * .08, y: H - Math.max(60, R * 2) - throwT * 110 });
-  function throwAt(tx, ty) {
-    const now = performance.now(); if (now - lastThrow < 120) return; lastThrow = now;
-    aimX = tx; aimY = ty; throwT = .15;
-    const h = handPos();
-    // depth of the tap point -> how small the star should be when it arrives
-    const z = ty > HY ? Math.max(1, CAM / (ty - HY)) : Z_FAR;
-    stars.push({ x0: h.x, y0: h.y - R * .9, tx, ty, p: 0, dur: .14 + Math.min(.16, z * .02), r0: R * .95, r1: Math.max(6, R * .95 / z * 1.3), rot: 0, miss: 0 });
+  // hand pose: pulls back a little and tips toward where you're aiming while you charge
+  function handGeom() {
+    const h = handPos(), w = Math.max(44, R * 1.7), sl = activeSlash(), c = sl ? chargeOf(sl, performance.now()) : 0;
+    return { x: h.x, y: h.y + c * w * .35, w, c, tier: tierOf(c), tilt: -.16 + (aimX - W / 2) / W * .3 };
+  }
+  function heldStar() { // where the star sits in the fingers, in screen space
+    const g = handGeom(), ly = -g.w * .7;
+    return { x: g.x - Math.sin(g.tilt) * ly, y: g.y + Math.cos(g.tilt) * ly, r: g.w * .5 };
+  }
+  // A slash is a finger/mouse drag. When it's let go, a star flies from where the slash
+  // started, along the line that was drawn, and keeps going down the path.
+  // power-up: the longer a drag is held, the stronger the star (tier 1 = normal, 2 = x2, 3 = x3)
+  const CHARGE_MS = 900, TAP = 28;
+  const TIER = {
+    1: { glow: 'rgba(150,210,255,', core: '#ffffff', g0: '#f2f4fb', g1: '#8e97b5', edge: '#3c3a5c' },
+    2: { glow: 'rgba(255,196,60,', core: '#fff6c8', g0: '#fff6c8', g1: '#f9b233', edge: '#8a5a00' },
+    3: { glow: 'rgba(255,90,40,', core: '#ffe2c4', g0: '#ffe2c4', g1: '#ff5a2a', edge: '#7a1c00' },
+  };
+  const chargeOf = (sl, now) => sl.moved ? Math.min(1, (now - sl.path[0].t) / CHARGE_MS) : 0;
+  const tierOf = c => c >= 1 ? 3 : c >= .5 ? 2 : 1;
+  const activeSlash = () => slashes.find(sl => sl.live);
+
+  function launch(x, y, ang, tier) {
+    const now = performance.now(); if (now - lastThrow < 120) return; lastThrow = now; throwT = .15;
+    const k = 1 + (tier - 1) * .3;
+    stars.push({ x, y, px: x, py: y, x0: x, y0: y, ang, vx: Math.cos(ang) * 2300, vy: Math.sin(ang) * 2300, tier, k,
+      r: Math.max(8, Math.min(R * .8, starSizeAt(y))) * k, rot: 0, miss: 0, hits: [] });
     sfx.whoosh();
+    if (tier > 1) { tone(tier === 3 ? 660 : 520, .12, 'triangle', .1, 0, 1.6); noise(.15, .08, 1200); }
+  }
+  function releaseSlash(sl) {
+    const p = sl.path, a = p[0], b = p[p.length - 1];
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+    aimX = b.x; aimY = b.y;
+    if (len < TAP) { // a tap: throw from the hand straight at that spot
+      const hs = heldStar();
+      launch(hs.x, hs.y, Math.atan2(b.y - hs.y, b.x - hs.x), 1);
+      return;
+    }
+    // a drag: the star flies along the exact angle of the line, from where it started and on past the end
+    launch(a.x, a.y, Math.atan2(dy, dx), tierOf(chargeOf(sl, b.t)));
+  }
+  // stars shrink as they fly "into" the scene (smaller the closer to the horizon)
+  function starSizeAt(y) {
+    if (y <= HY + 1) return 3;
+    const z = Math.max(1, CAM / (y - HY));
+    return Math.max(3, Math.min(R * .95, R * .95 / z * 1.3));
   }
   function juice(x, y, col, n, power, scale) {
     for (let i = 0; i < n; i++) { const a = rand(0, 6.28), v = rand(60, power) * scale; drops.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 60 * scale, r: rand(3, 7) * Math.max(.5, scale), col, life: rand(.4, .8) }); }
   }
   function land(s) {
-    // the closest fruit under the target point gets hit
-    const target = enemies.filter(en => !en.dead && en.sr && Math.hypot(en.sx - s.tx, en.sy - s.ty) < en.sr * 1.1 + 14).sort((a, b) => a.z - b.z)[0];
-    if (target) { hit(target, s); return true; }
-    return false;
+    // did the star's path this frame pass through a fruit? the first one it touches gets hit
+    const sx = s.x - s.px, sy = s.y - s.py, L2 = sx * sx + sy * sy || 1;
+    let target = null, tBest = 2;
+    for (const en of enemies) {
+      if (en.dead || !en.sr || en.sr < 6 || en.z > Z_FAR + .3 || s.hits.includes(en)) continue;
+      const t = Math.max(0, Math.min(1, ((en.sx - s.px) * sx + (en.sy - s.py) * sy) / L2));
+      const cx = s.px + sx * t, cy = s.py + sy * t;
+      if (Math.hypot(en.sx - cx, en.sy - cy) < en.sr * .85 + s.r * .4 && (t < tBest || (t === tBest && en.z < target.z))) { tBest = t; target = en; }
+    }
+    if (!target) return false;
+    s.hits.push(target);
+    return hit(target, s.px + sx * tBest, s.py + sy * tBest, s) ? 'through' : 'stick';
   }
-  function hit(en, s) {
-    en.hp--; en.flash = .18; en.wob = .45; en.kb = 2.6;
+  function hit(en, hx, hy, s) {
+    en.hp = Math.max(0, en.hp - s.tier); en.flash = .18 + (s.tier - 1) * .08; en.wob = .45; en.kb = 2.6;
+    const dz = dizzy(en);
+    en.spinV += (Math.random() < .5 ? -1 : 1) * rand(6, 10) * (.6 + dz); // wobbly spin
+    en.dashT = 0;                                                        // dart somewhere new right away
+    // the star sticks where it hit (stored in the fruit's own spinning frame)
+    let ox = (hx - en.sx) / en.sr, oy = (hy - en.sy) / en.sr;
+    const c = Math.cos(-en.tilt), si = Math.sin(-en.tilt);
+    [ox, oy] = [ox * c - oy * si, ox * si + oy * c];
+    const ol = Math.hypot(ox, oy); if (ol > .62) { ox *= .62 / ol; oy *= .62 / ol; }
+    const rel = s.ang - en.tilt;               // throw angle in the fruit's own frame
+    en.stuck.push({ ox, oy, a: rel, tier: s.tier });
+    cuts.push({ x: hx, y: hy, ang: s.ang, len: en.sr * (2.4 + (s.tier - 1) * .5), life: .28, tier: s.tier });
+    if (s.tier > 1) { texts.push({ x: hx, y: hy + en.sr * 1.1, t: s.tier === 3 ? 'MEGA x3! 🔥' : 'Power x2! ⚡', life: .9, big: true }); shake = Math.max(shake, .08 * s.tier); }
     const sc = Math.min(1.6, 1.6 / en.z * 1.4);
-    juice(s.tx, s.ty, en.col, 6, 200, sc);
-    if (en.hp > 0) { tone(320 + (en.max - en.hp) * 60, .09, 'square', .06); return; }
+    juice(hx, hy, en.col, 6, 200, sc);
+    if (en.hp > 0) { tone(320 + (en.max - en.hp) * 60, .09, 'square', .06); noise(.04, .08, 3200); return false; }
     en.dead = true; defeated++;
+    // stuck stars pop loose and tumble away
+    const c2 = Math.cos(en.tilt), s2 = Math.sin(en.tilt);
+    for (const st of en.stuck) {
+      const lx = st.ox * en.sr, ly = st.oy * en.sr;
+      loose.push({ x: en.sx + lx * c2 - ly * s2, y: en.sy + lx * s2 + ly * c2, vx: rand(-160, 160) * sc, vy: -rand(120, 260) * sc, rot: st.a, vr: rand(-12, 12), r: en.sr * .36, life: 1.2, tier: st.tier });
+    }
     $('#bScore').textContent = '🍉 ' + defeated;
     const sp = rand(110, 170) * sc;
-    [-1, 1].forEach(side => pieces.push({ e: en.e, side, x: en.sx, y: en.sy, vx: side * sp, vy: -rand(140, 240) * sc, rot: 0, vr: side * rand(2, 4), r: en.sr, life: 1.4 }));
+    // two halves split along the throw line, pushed apart sideways from the cut
+    const nx = -Math.sin(s.ang), ny = Math.cos(s.ang), fx = Math.cos(s.ang) * sp * .35, fy = Math.sin(s.ang) * sp * .35;
+    [-1, 1].forEach(side => pieces.push({ e: en.e, col: en.col, side, cut: s.ang - en.tilt, x: en.sx, y: en.sy,
+      vx: side * nx * sp + fx, vy: side * ny * sp + fy - rand(120, 200) * sc, rot: en.tilt, vr: side * rand(1.5, 3.5), r: en.sr, life: 1.4 }));
     juice(en.sx, en.sy, en.col, 18, 340, sc);
     texts.push({ x: en.sx, y: en.sy - en.sr, t: pick(CHEERS), life: 1, big: true });
     sfx.slice();
+    return true; // sliced clean through: the star keeps flying
   }
 
   /* --- simulation --- */
@@ -870,12 +949,23 @@ const Break = (() => {
 
     for (const en of enemies) {
       en.t += dt; en.flash -= dt; en.wob = Math.max(0, en.wob - dt);
+      // springy spin that settles back upright
+      en.spinV += -en.spin * 40 * dt; en.spinV *= Math.max(0, 1 - 2.5 * dt); en.spin += en.spinV * dt;
       if (!ending) {
-        en.base += en.drift * dt;
-        if (Math.abs(en.base) > .85) en.drift = -Math.sign(en.base) * Math.abs(en.drift);
-        en.wx = Math.max(-1.05, Math.min(1.05, en.base + Math.sin(en.t * 1.3) * .3 * en.sway));
+        const dz = dizzy(en);
+        if (dz > 0) { // once hit: dart to random spots, zig-zag and lurch
+          en.dashT -= dt;
+          if (en.dashT <= 0) { en.goal = rand(-.85, .85); en.dashT = rand(.55, 1.3) - dz * .3; }
+          en.base += (en.goal - en.base) * Math.min(1, dt * (2 + dz * 3));
+        } else {
+          en.base += en.drift * dt;
+          if (Math.abs(en.base) > .85) en.drift = -Math.sign(en.base) * Math.abs(en.drift);
+        }
+        const zig = dz * (Math.sin(en.t * 9.1) * .13 + Math.sin(en.t * 3.3) * .18);
+        en.wx = Math.max(-1.05, Math.min(1.05, en.base + Math.sin(en.t * 1.3) * .3 * en.sway + zig));
         en.kb += (0 - en.kb) * Math.min(1, dt * 5);
-        en.z = Math.min(Z_FAR + 4, en.z - (en.vz - en.kb) * dt);
+        const lurch = Math.max(.3, 1 + .7 * dz * Math.sin(en.t * 3.7));
+        en.z = Math.min(Z_FAR + 4, en.z - (en.vz * lurch - en.kb) * dt);
         if (en.z <= Z_NEAR) { // reached you: boing back down the path
           en.z = Z_FAR - rand(0, .8); en.base = rand(-.7, .7);
           texts.push({ x: W / 2, y: H * .55, t: 'Boing!', life: .9, big: true });
@@ -885,15 +975,20 @@ const Break = (() => {
       place(en);
     }
     for (const s of stars) {
-      s.rot += 20 * dt;
+      s.rot += 22 * dt;
+      s.px = s.x; s.py = s.y; s.x += s.vx * dt; s.y += s.vy * dt;
+      s.r = Math.max(7, Math.min(s.r, starSizeAt(s.y) * s.k));
       if (!s.miss) {
-        s.p += dt / s.dur;
-        if (s.p >= 1) { s.p = 1; if (land(s)) s.dead = true; else s.miss = .3; }
-      } else { // missed: zip away toward the horizon
-        s.miss -= dt; s.tx += (W / 2 - s.tx) * dt * 4; s.ty += (HY - s.ty) * dt * 4; s.r1 *= Math.pow(.02, dt);
-        if (s.miss <= 0) s.dead = true;
-      }
+        if (land(s) === 'stick') s.dead = true;
+        else if (s.x < -60 || s.x > W + 60 || s.y > H + 60 || s.y < HY - H * .12) s.miss = .25;
+      } else { s.miss -= dt; s.vx *= .9; s.vy *= .9; if (s.miss <= 0) s.dead = true; }
     }
+    for (const l of loose) { l.x += l.vx * dt; l.y += l.vy * dt; l.vy += H * 1.1 * dt; l.rot += l.vr * dt; l.life -= dt; }
+    loose = loose.filter(l => l.life > 0 && l.y < H + 60);
+    const as = activeSlash();
+    if (as) { const t = tierOf(chargeOf(as, performance.now())); if (t > (as.dinged || 1)) { as.dinged = t; tone(t === 3 ? 880 : 660, .1, 'triangle', .09); } }
+    for (const c of cuts) c.life -= dt;
+    cuts = cuts.filter(c => c.life > 0);
     for (const p of pieces) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += H * 1.2 * dt; p.rot += p.vr * dt; p.life -= dt; }
     for (const d of drops) { d.x += d.vx * dt; d.y += d.vy * dt; d.vy += H * .8 * dt; d.life -= dt; }
     for (const c of confetti) { c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; c.life -= dt; }
@@ -908,14 +1003,16 @@ const Break = (() => {
 
   /* --- drawing --- */
   function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
-  function drawShuriken(x, y, r, rot, alpha = 1) {
+  function drawShuriken(x, y, r, rot, alpha = 1, tier = 1, glow = 0) {
+    const T = TIER[tier] || TIER[1];
     ctx.save(); ctx.globalAlpha = alpha; ctx.translate(x, y); ctx.rotate(rot);
+    if (tier > 1 || glow) { ctx.shadowColor = T.glow + '.95)'; ctx.shadowBlur = Math.max(6, r * (.6 + glow)); }
     ctx.beginPath();
     for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4, rr = i % 2 ? r * .36 : r; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
     ctx.closePath();
-    const g = ctx.createLinearGradient(-r, -r, r, r); g.addColorStop(0, '#f2f4fb'); g.addColorStop(1, '#8e97b5');
-    ctx.fillStyle = g; ctx.fill(); ctx.lineWidth = Math.max(1, r * .08); ctx.strokeStyle = '#3c3a5c'; ctx.stroke();
-    ctx.beginPath(); ctx.arc(0, 0, r * .16, 0, 7); ctx.fillStyle = '#3c3a5c'; ctx.fill();
+    const g = ctx.createLinearGradient(-r, -r, r, r); g.addColorStop(0, T.g0); g.addColorStop(1, T.g1);
+    ctx.fillStyle = g; ctx.fill(); ctx.shadowBlur = 0; ctx.lineWidth = Math.max(1, r * .08); ctx.strokeStyle = T.edge; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, r * .16, 0, 7); ctx.fillStyle = T.edge; ctx.fill();
     ctx.restore();
   }
   function drawEnemy(en) {
@@ -925,9 +1022,26 @@ const Break = (() => {
     // shadow on the path
     ctx.fillStyle = 'rgba(30,20,40,.25)'; ctx.beginPath();
     ctx.ellipse(en.sx, en.foot, r * .7 * (1 - en.hop / (r * .8)), r * .16, 0, 0, 7); ctx.fill();
-    const pop = 1 + Math.max(0, en.flash) * 1.2, tilt = Math.sin(en.t * 5.5) * .08 + Math.sin(en.wob * 40) * en.wob * .6;
-    ctx.translate(en.sx, en.sy); ctx.rotate(tilt); ctx.scale(pop, pop);
+    const dz = dizzy(en), pop = 1 + Math.max(0, en.flash) * 1.2, tilt = en.tilt = tiltOf(en);
+    const sq = .1 * dz * Math.sin(en.t * 11); // squishy jelly wobble
+    ctx.translate(en.sx, en.sy); ctx.rotate(tilt); ctx.scale(pop * (1 + sq), pop * (1 - sq));
     ctx.drawImage(sprite(en.e), -r, -r, r * 2, r * 2);
+    // ninja stars stuck in it
+    ctx.save(); ctx.beginPath(); ctx.arc(0, 0, r * .8, 0, 7); ctx.clip();
+    for (const st of en.stuck) { // cut marks along each throw line
+      const x = st.ox * r, y = st.oy * r, cx = Math.cos(st.a) * r * .7, cy = Math.sin(st.a) * r * .7;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(43,33,64,.55)'; ctx.lineWidth = Math.max(2, r * .09);
+      ctx.beginPath(); ctx.moveTo(x - cx, y - cy); ctx.lineTo(x + cx * .4, y + cy * .4); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = Math.max(1, r * .03);
+      ctx.beginPath(); ctx.moveTo(x - cx, y - cy - r * .03); ctx.lineTo(x + cx * .4, y + cy * .4 - r * .03); ctx.stroke();
+    }
+    ctx.restore();
+    for (const st of en.stuck) {
+      const x = st.ox * r, y = st.oy * r;
+      ctx.fillStyle = 'rgba(43,33,64,.35)'; ctx.beginPath(); ctx.ellipse(x + r * .03, y + r * .05, r * .17, r * .08, st.a, 0, 7); ctx.fill();
+      drawShuriken(x, y, r * .36, st.a, fade, st.tier);
+    }
     // cartoon eyes looking right at you
     const er = r * .2, ey = -r * .02;
     for (const s of [-1, 1]) {
@@ -937,8 +1051,11 @@ const Break = (() => {
       if (en.flash > 0) {
         ctx.beginPath(); ctx.moveTo(ex - s * er * .6, ey - er * .35); ctx.lineTo(ex + s * er * .6, ey); ctx.lineTo(ex - s * er * .6, ey + er * .35); ctx.stroke();
       } else {
-        ctx.fillStyle = '#2b2140'; ctx.beginPath(); ctx.arc(ex - s * er * .12, ey + er * .15, er * .55, 0, 7); ctx.fill();
-        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex - s * er * .12 + er * .2, ey - er * .05, er * .17, 0, 7); ctx.fill();
+        // dizzy pupils roll around once it's been hit a bunch
+        const spinA = en.t * 9 * s, roll = dz >= .5 ? er * .32 : 0;
+        const px = ex - s * er * .12 * (1 - roll / er * 3) + Math.cos(spinA) * roll, py = ey + er * .15 * (1 - roll / er * 3) + Math.sin(spinA) * roll;
+        ctx.fillStyle = '#2b2140'; ctx.beginPath(); ctx.arc(px, py, er * .55, 0, 7); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(px + er * .2, py - er * .2, er * .17, 0, 7); ctx.fill();
       }
       ctx.strokeStyle = '#2b2140'; ctx.lineWidth = Math.max(1.5, r * .07); ctx.lineCap = 'round';
       ctx.beginPath(); ctx.moveTo(ex + s * er * .9, ey - er * 1.55); ctx.lineTo(ex - s * er * .7, ey - er * 1.2); ctx.stroke();
@@ -955,22 +1072,67 @@ const Break = (() => {
     }
   }
   function drawHand() {
-    // first-person ninja arm from the bottom-right, fist holding the next ninja star
-    const h = handPos(), base = { x: W * .9, y: H + 90 }, w = Math.max(44, R * 1.7);
-    const ang = Math.atan2(h.y - base.y, h.x - base.x), len = Math.hypot(h.x - base.x, h.y - base.y);
-    ctx.save(); ctx.translate(base.x, base.y); ctx.rotate(ang);
-    ctx.fillStyle = '#2b2140'; roundRect(-20, -w * .55, len - w * .2, w * 1.1, w * .5); ctx.fill();
-    ctx.fillStyle = '#e8505b'; roundRect(len - w * .75, -w * .58, w * .28, w * 1.16, 6); ctx.fill();
-    ctx.restore();
-    if (performance.now() - lastThrow > 220) drawShuriken(h.x, h.y - w * .62, w * .55, -.3);
-    ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(-.15);
-    ctx.fillStyle = '#ffdcbc'; ctx.strokeStyle = '#d9a782'; ctx.lineWidth = 2;
-    roundRect(-w * .55, -w * .45, w * 1.1, w * .95, w * .3); ctx.fill(); ctx.stroke();
-    for (let i = 0; i < 4; i++) { // knuckles
-      ctx.beginPath(); ctx.ellipse(-w * .38 + i * w * .255, -w * .42, w * .14, w * .12, 0, 0, 7); ctx.fill(); ctx.stroke();
+    // first-person ninja arm from the bottom-right; a dark glove pinches the next star
+    const g = handGeom(), { x, y, w, tilt, c } = g, now = performance.now(), charging = c > 0;
+    const sin = Math.sin(tilt), cos = Math.cos(tilt);
+    ctx.save(); ctx.translate(x, y); ctx.rotate(tilt);
+    const G = '#3e3573', GL = '#544a94', GD = '#211a3d', lw = Math.max(2, w * .045);
+    // forearm in a dark sleeve, angled down and to the right, joined under the wrist wrap
+    ctx.fillStyle = '#2b2140'; ctx.beginPath();
+    ctx.moveTo(-w * .4, w * .4); ctx.lineTo(w * .4, w * .4); ctx.lineTo(w * 1.7, w * 3.4); ctx.lineTo(w * .1, w * 3.6); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.09)'; ctx.lineWidth = Math.max(2, w * .06); ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(w * .22, w * .62); ctx.lineTo(w * 1.2, w * 3.3); ctx.stroke();
+    // red wrist wrap
+    ctx.fillStyle = '#e8505b'; roundRect(-w * .4, w * .3, w * .8, w * .26, w * .08); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,20,40,.35)'; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(-w * .38, w * .43); ctx.lineTo(w * .38, w * .4); ctx.stroke();
+    // the next star, held up behind the fingers
+    if (now - lastThrow > 220) {
+      const spin = charging ? now / 1000 * (4 + c * 14) : -.3;
+      drawShuriken(0, -w * .7, w * .5 * (1 + c * .15), spin, 1, charging ? g.tier : 1, charging ? c : 0);
     }
-    ctx.beginPath(); ctx.ellipse(-w * .5, -w * .02, w * .16, w * .3, .3, 0, 7); ctx.fill(); ctx.stroke(); // thumb
+    ctx.lineJoin = 'round'; ctx.strokeStyle = GD; ctx.lineWidth = lw;
+    // back of the glove
+    ctx.fillStyle = G; roundRect(-w * .44, -w * .32, w * .88, w * .7, w * .26); ctx.fill(); ctx.stroke();
+    // curled fingers
+    ctx.fillStyle = GL; roundRect(-w * .44, -w * .58, w * .84, w * .34, w * .16); ctx.fill(); ctx.stroke();
+    ctx.lineWidth = lw * .8;
+    for (let i = 1; i < 4; i++) { const fx = -w * .44 + i * w * .21; ctx.beginPath(); ctx.moveTo(fx, -w * .53); ctx.lineTo(fx, -w * .36); ctx.stroke(); }
+    ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(-w * .32, -w * .5); ctx.lineTo(w * .26, -w * .5); ctx.stroke();
+    // thumb pressing the star from the left
+    ctx.save(); ctx.translate(-w * .43, -w * .12); ctx.rotate(.22);
+    ctx.fillStyle = GL; ctx.strokeStyle = GD; ctx.lineWidth = lw;
+    roundRect(-w * .14, -w * .42, w * .28, w * .58, w * .14); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,.2)'; ctx.beginPath(); ctx.moveTo(-w * .05, -w * .3); ctx.lineTo(-w * .05, w * .02); ctx.stroke();
     ctx.restore();
+    // glove plate (tekko) detail
+    ctx.fillStyle = 'rgba(255,255,255,.1)'; roundRect(-w * .2, -w * .14, w * .4, w * .3, w * .1); ctx.fill();
+    // power-up ring around the held star
+    if (charging) {
+      const T = TIER[g.tier];
+      ctx.lineWidth = Math.max(3, w * .08); ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(43,33,64,.5)'; ctx.beginPath(); ctx.arc(0, -w * .7, w * .72, 0, 7); ctx.stroke();
+      ctx.strokeStyle = T.glow + '1)'; ctx.shadowColor = T.glow + '1)'; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(0, -w * .7, w * .72, -Math.PI / 2, -Math.PI / 2 + c * Math.PI * 2); ctx.stroke(); ctx.shadowBlur = 0;
+    }
+    ctx.restore();
+  }
+  function drawSlashes() {
+    const now = performance.now(), FADE = 220;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const sl of slashes) {
+      const p = sl.path;
+      for (let pass = 0; pass < 2; pass++) for (let i = 1; i < p.length; i++) {
+        const k = sl.live && sl.moved ? Math.max(.35, 1 - (now - p[i].t) / 600) : 1 - (now - (sl.live ? p[i].t : Math.max(p[i].t, sl.endT - 120))) / FADE; if (k <= 0) continue;
+        const T = TIER[sl.live ? tierOf(chargeOf(sl, now)) : (sl.tier || 1)];
+        ctx.strokeStyle = pass ? T.core : T.glow + (.45 * k) + ')'; ctx.globalAlpha = pass ? k : 1;
+        ctx.lineWidth = pass ? 2 + 5 * k : 6 + 14 * k;
+        ctx.beginPath(); ctx.moveTo(p[i - 1].x, p[i - 1].y); ctx.lineTo(p[i].x, p[i].y); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+    slashes = slashes.filter(sl => sl.live || now - sl.endT < FADE);
   }
   function draw() {
     ctx.save();
@@ -980,18 +1142,37 @@ const Break = (() => {
     for (const p of pieces) {
       const sp = sprite(p.e);
       ctx.save(); ctx.globalAlpha = Math.min(1, p.life); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
-      if (p.side < 0) ctx.drawImage(sp, 0, 0, 64, 128, -p.r, -p.r, p.r, p.r * 2);
-      else ctx.drawImage(sp, 64, 0, 64, 128, 0, -p.r, p.r, p.r * 2);
+      ctx.save(); ctx.rotate(p.cut); ctx.beginPath();
+      if (p.side < 0) ctx.rect(-p.r * 2, -p.r * 2, p.r * 4, p.r * 2); else ctx.rect(-p.r * 2, 0, p.r * 4, p.r * 2);
+      ctx.restore(); ctx.clip();
+      ctx.drawImage(sp, -p.r, -p.r, p.r * 2, p.r * 2);
+      ctx.rotate(p.cut); ctx.strokeStyle = p.col; ctx.lineWidth = Math.max(2, p.r * .1); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-p.r * .75, 0); ctx.lineTo(p.r * .75, 0); ctx.stroke();
       ctx.restore();
     }
     for (const d of drops) { ctx.globalAlpha = Math.max(0, d.life); ctx.fillStyle = d.col; ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, 7); ctx.fill(); }
     ctx.globalAlpha = 1;
+    for (const l of loose) drawShuriken(l.x, l.y, l.r, l.rot, Math.min(1, l.life * 2), l.tier);
+    ctx.lineCap = 'round';
     for (const s of stars) {
-      const e = s.p * (2 - s.p); // ease out
-      const x = s.miss ? s.tx : s.x0 + (s.tx - s.x0) * e, y = s.miss ? s.ty : s.y0 + (s.ty - s.y0) * e, r = s.miss ? s.r1 : s.r0 + (s.r1 - s.r0) * e;
-      drawShuriken(x, y, r, s.rot, s.miss ? Math.max(0, s.miss / .3) : 1);
+      const tl = Math.min(220, Math.hypot(s.x - s.x0, s.y - s.y0)), al = s.miss ? Math.max(0, s.miss / .25) : 1;
+      if (tl > 4) {
+        const g = ctx.createLinearGradient(s.x - Math.cos(s.ang) * tl, s.y - Math.sin(s.ang) * tl, s.x, s.y);
+        g.addColorStop(0, TIER[s.tier].glow + '0)'); g.addColorStop(1, TIER[s.tier].glow + (.9 * al) + ')');
+        ctx.strokeStyle = g; ctx.lineWidth = Math.max(3, s.r * (.7 + (s.tier - 1) * .2));
+        ctx.beginPath(); ctx.moveTo(s.x - Math.cos(s.ang) * tl, s.y - Math.sin(s.ang) * tl); ctx.lineTo(s.x, s.y); ctx.stroke();
+      }
+      drawShuriken(s.x, s.y, s.r, s.rot, al, s.tier);
+    }
+    for (const c of cuts) {
+      const k = c.life / .28, dx = Math.cos(c.ang) * c.len / 2, dy = Math.sin(c.ang) * c.len / 2;
+      ctx.strokeStyle = `rgba(255,255,255,${k})`; ctx.lineWidth = 2 + 6 * k;
+      ctx.shadowColor = TIER[c.tier].glow + '.9)'; ctx.shadowBlur = 14 * k;
+      ctx.beginPath(); ctx.moveTo(c.x - dx, c.y - dy); ctx.lineTo(c.x + dx, c.y + dy); ctx.stroke();
+      ctx.shadowBlur = 0;
     }
     drawHand();
+    drawSlashes();
     if (bump) { ctx.fillStyle = `rgba(255,154,162,${bump * 1.2})`; ctx.fillRect(0, 0, W, H); }
     ctx.restore();
     for (const c of confetti) { ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot); ctx.fillStyle = c.col; ctx.fillRect(-4, -6, 8, 12); ctx.restore(); }
@@ -1025,12 +1206,35 @@ const Break = (() => {
     if (ending && endT <= 0) { running = false; onDone(defeated, cleared, level); return; }
     requestAnimationFrame(loop);
   }
-  cv.addEventListener('pointerdown', e => { if (!running || ending) return; e.preventDefault(); throwAt(e.clientX, e.clientY); });
+  // input: press, drag a slash, let go to throw
+  cv.addEventListener('pointerdown', e => {
+    if (!running || ending) return; e.preventDefault();
+    try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+    slashes.push({ id: e.pointerId, live: true, path: [{ x: e.clientX, y: e.clientY, t: performance.now() }] });
+  });
+  cv.addEventListener('pointermove', e => {
+    const sl = slashes.find(s => s.live && s.id === e.pointerId); if (!sl) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (evs.length ? evs : [e])) sl.path.push({ x: ev.clientX, y: ev.clientY, t: performance.now() });
+    const a = sl.path[0];
+    if (!sl.moved && Math.hypot(e.clientX - a.x, e.clientY - a.y) >= TAP) sl.moved = true;
+    if (sl.moved) aimX = e.clientX;
+    if (sl.path.length > 240) sl.path.splice(1, sl.path.length - 240);
+  });
+  const endSlash = (e, release) => {
+    const sl = slashes.find(s => s.live && s.id === e.pointerId); if (!sl) return;
+    const now = performance.now();
+    sl.tier = tierOf(chargeOf(sl, now)); sl.live = false; sl.endT = now;
+    sl.path.push({ x: e.clientX, y: e.clientY, t: now });
+    if (release && running && !ending) releaseSlash(sl);
+  };
+  cv.addEventListener('pointerup', e => endSlash(e, true));
+  cv.addEventListener('pointercancel', e => endSlash(e, false));
   window.addEventListener('resize', () => { if (running) resize(); });
   return {
     start(done) {
       onDone = done; resize();
-      stars = []; pieces = []; drops = []; texts = []; confetti = [];
+      stars = []; pieces = []; drops = []; texts = []; confetti = []; slashes = []; loose = []; cuts = [];
       level = Math.max(1, S.ninjaLevel | 0); defeated = 0; cleared = 0; nextLevelT = 0; shake = 0; bump = 0;
       timeLeft = S.breakSecs; ending = false; secShown = -1; aimX = W / 2; aimY = H / 2;
       $('#bScore').textContent = '🍉 0';

@@ -1,6 +1,6 @@
 /* Math Ninja Dojo service worker — makes the game work offline.
    When you change any game file, bump CACHE_VERSION so players get the update. */
-const CACHE_VERSION = 'math-ninja-v3';
+const CACHE_VERSION = 'math-ninja-v6';
 const CORE = [
   './',
   './index.html',
